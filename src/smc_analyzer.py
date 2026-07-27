@@ -9,6 +9,7 @@ from smartmoneyconcepts import smc
 
 SWING_LENGTH = 20
 RECENT_OB_LOOKBACK = 30
+RECENT_FVG_LOOKBACK = 30
 
 
 def _prepare_ohlc(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,17 +38,29 @@ def _get_bias(bos_choch: pd.DataFrame) -> str:
 
 
 def _get_last_structure_event(bos_choch: pd.DataFrame) -> dict | None:
-    """Последнее событие BOS или CHoCH."""
+    """Последнее по времени событие — BOS ИЛИ CHoCH, смотря что свежее.
+
+    Раньше здесь сначала проверялся BOS целиком и возвращался, если там
+    было хоть одно ненулевое значение — даже если CHoCH случился позже и
+    был более свежим событием. Теперь сравниваются индексы обоих и
+    возвращается действительно последнее.
+    """
+    candidates: list[tuple[int, str, Any]] = []
     for col in ("BOS", "CHOCH"):
         idx, value = _last_valid_row(bos_choch[col])
         if idx is not None:
-            return {
-                "type": col,
-                "direction": "bullish" if value == 1 else "bearish",
-                "level": float(bos_choch.loc[idx, "Level"]),
-                "index": idx,
-            }
-    return None
+            candidates.append((idx, col, value))
+
+    if not candidates:
+        return None
+
+    idx, col, value = max(candidates, key=lambda c: c[0])
+    return {
+        "type": col,
+        "direction": "bullish" if value == 1 else "bearish",
+        "level": float(bos_choch.loc[idx, "Level"]),
+        "index": idx,
+    }
 
 
 def _premium_discount_zone(
@@ -81,10 +94,7 @@ def _premium_discount_zone(
 def _collect_order_blocks(ob_df: pd.DataFrame, lookback: int = RECENT_OB_LOOKBACK) -> list[dict]:
     blocks: list[dict] = []
     mask = ob_df["OB"].fillna(0) != 0
-    if lookback > 0:
-        candidates = ob_df[mask].tail(lookback)
-    else:
-        candidates = ob_df[mask]
+    candidates = ob_df[mask].tail(lookback) if lookback > 0 else ob_df[mask]
     for idx, row in candidates.iterrows():
         blocks.append(
             {
@@ -92,71 +102,43 @@ def _collect_order_blocks(ob_df: pd.DataFrame, lookback: int = RECENT_OB_LOOKBAC
                 "direction": "bullish" if row["OB"] == 1 else "bearish",
                 "top": float(row["Top"]),
                 "bottom": float(row["Bottom"]),
+                "kind": "OB",
             }
         )
     return blocks
 
 
-def _find_active_ob(
-    order_blocks: list[dict],
-    current_price: float,
-    direction: str,
-    tolerance_pct: float = 0.002,
-) -> dict | None:
-    """Ищет свежий OB нужного направления, внутри которого (или у границы) текущая цена."""
-    matching = [ob for ob in order_blocks if ob["direction"] == direction]
-    if not matching:
-        return None
-
-    # Берём самый свежий (последний по индексу)
-    ob = max(matching, key=lambda x: x["index"])
-    top, bottom = ob["top"], ob["bottom"]
-    zone_height = top - bottom
-    buffer = max(zone_height * tolerance_pct, top * tolerance_pct)
-
-    if direction == "bullish":
-        in_zone = (bottom - buffer) <= current_price <= (top + buffer)
-    else:
-        in_zone = (bottom - buffer) <= current_price <= (top + buffer)
-
-    if in_zone:
-        return ob
-    return None
+def _collect_fvgs(fvg_df: pd.DataFrame, lookback: int = RECENT_FVG_LOOKBACK) -> list[dict]:
+    """FVG (Fair Value Gap / имбаланс) — тот же формат, что и order block'и
+    (index/direction/top/bottom), плюс "kind": "FVG", чтобы дальше их можно
+    было искать одной и той же функцией (см. scanner._find_zone_near_price).
+    """
+    zones: list[dict] = []
+    mask = fvg_df["FVG"].fillna(0) != 0
+    candidates = fvg_df[mask].tail(lookback) if lookback > 0 else fvg_df[mask]
+    for idx, row in candidates.iterrows():
+        zones.append(
+            {
+                "index": int(idx),
+                "direction": "bullish" if row["FVG"] == 1 else "bearish",
+                "top": float(row["Top"]),
+                "bottom": float(row["Bottom"]),
+                "kind": "FVG",
+            }
+        )
+    return zones
 
 
-def _nearest_liquidity_target(
-    liquidity: pd.DataFrame,
-    current_price: float,
-    direction: str,
-) -> float | None:
-    """Ближайший уровень ликвидности как цель."""
-    liq = liquidity.dropna(subset=["Liquidity"])
-    liq = liq[liq["Liquidity"] != 0]
-    if liq.empty:
-        return None
-
-    if direction == "bullish":
-        above = liq[liq["Level"] > current_price]
-        if above.empty:
-            return None
-        return float(above["Level"].min())
-
-    below = liq[liq["Level"] < current_price]
-    if below.empty:
-        return None
-    return float(below["Level"].max())
-
-
-def analyze_smc(df: pd.DataFrame, higher_tf: str) -> dict:
+def analyze_smc(df: pd.DataFrame, timeframe_label: str) -> dict:
     """
     Запускает SMC-индикаторы и возвращает структурированный результат.
 
     Args:
         df: OHLCV DataFrame
-        higher_tf: контекстный таймфрейм (H4, H1 и т.д.) — для логов/сообщений
+        timeframe_label: метка таймфрейма (H4, H1, M15...) — для логов/сообщений
 
     Returns:
-        dict с bias, structure, order_blocks, premium_discount, fvg, current_price
+        dict с bias, structure, order_blocks, fvgs, premium_discount, current_price
     """
     ohlc = _prepare_ohlc(df)
     current_price = float(ohlc["close"].iloc[-1])
@@ -168,17 +150,18 @@ def analyze_smc(df: pd.DataFrame, higher_tf: str) -> dict:
     liquidity = smc.liquidity(ohlc, swings, range_percent=0.01)
 
     order_blocks = _collect_order_blocks(ob_df)
+    fvgs = _collect_fvgs(fvg_df)
     zone = _premium_discount_zone(ohlc, swings, current_price)
 
     return {
-        "timeframe": higher_tf,
+        "timeframe": timeframe_label,
         "current_price": current_price,
         "bias": _get_bias(bos_choch),
         "last_structure": _get_last_structure_event(bos_choch),
         "premium_discount": zone,
         "order_blocks": order_blocks,
-        "active_ob": None,  # заполняется в scanner при проверке сетапа
-        "fvg_count": int((fvg_df["FVG"].fillna(0) != 0).sum()),
+        "fvgs": fvgs,
+        "fvg_count": len(fvgs),
         "liquidity_df": liquidity,
         "swing_range": {
             "high": float(swings[swings["HighLow"] == 1]["Level"].dropna().iloc[-1])
@@ -188,9 +171,9 @@ def analyze_smc(df: pd.DataFrame, higher_tf: str) -> dict:
             if not swings[swings["HighLow"] == -1]["Level"].dropna().empty
             else None,
         },
-        "_liquidity_helper": _nearest_liquidity_target,
     }
 
 
-def format_ob_zone(ob: dict) -> str:
-    return f"{ob['bottom']:.4f} – {ob['top']:.4f}"
+def format_ob_zone(zone: dict) -> str:
+    kind = zone.get("kind", "OB")
+    return f"{kind} {zone['bottom']:.4f} – {zone['top']:.4f}"
